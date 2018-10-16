@@ -39,7 +39,7 @@ print("Scanning rom for possible keys... (this might take a while)")
 
 # I'm sure this can be improved.
 while True:
-	progressBar(pos, rom_size, 30)
+	progressBar(pos, rom_size)
 
 	try:
 		chunk = rom.read(8)
