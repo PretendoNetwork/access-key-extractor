@@ -24,7 +24,7 @@ def is_valid(string):
 	return re.fullmatch(r'[0-9a-f]+', string) is not None
 
 # https://stackoverflow.com/a/37630397
-def progressBar(value, endvalue, bar_length=20):
+def progressBar(value, endvalue, bar_length=30):
 
 	percent = float(value) / endvalue
 	arrow = '-' * int(round(percent * bar_length)-1) + '>'
