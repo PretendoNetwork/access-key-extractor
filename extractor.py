@@ -30,7 +30,7 @@ def progressBar(value, endvalue, bar_length=30):
 	arrow = '-' * int(round(percent * bar_length)-1) + '>'
 	spaces = ' ' * (bar_length - len(arrow))
 
-	sys.stdout.write("\rProgress: [{}] {:.0%}".format(arrow + spaces, percent * 100))
+	sys.stdout.write("\rProgress: [{}] {:.0%}".format(arrow + spaces, percent))
 	sys.stdout.flush()
 
 startTime = datetime.now()
