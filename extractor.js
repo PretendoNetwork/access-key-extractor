@@ -59,8 +59,58 @@ if (MAGIC_V1.equals(packetBuffer.subarray(0, 2))) {
 
 // Decode the packet as PRUDPv0 and check the signature
 function checkPacketV0() {
-	// TODO
+	// Grab original checksum
+	oldcheck = Buffer.from([packetBuffer[packetBuffer.length - 1]]);
+
+	// Loop over all possible keys and calculate the checksum with the given key
+	for (const possibleKey of possibleKeys) {
+		console.log("Trying key: " + possibleKey);
+		newcheck = calc_checksum(possibleKey, packetBuffer.slice(0, packetBuffer.length - 1));
+		
+		// If a match is found, output the key and kill the loop
+		if(oldcheck.equals(Buffer.from([newcheck]))) {
+			console.timeEnd('Parsing rom for access keys');
+			console.log(`Found working access key: ${possibleKey}`);
+			return;
+		}
+	}
 	console.timeEnd('Parsing rom for access keys');
+
+	console.log('No possible access keys found for provided test packet. Was the test packet sent from the provided title?');
+}
+
+// Calculate V0 checksum (grabbed from https://github.com/andreluis034/prudp/blob/master/libs/Packets/PRUDPPacketVersion0.js, with slight modifications)
+function calc_checksum(key, buffer) {
+	let number = 0;
+	if(typeof key === 'string') {
+		key = Buffer.from(key);
+	} 
+	if (key instanceof Buffer) {
+		key = key.reduce((a, b) => { return a + b; });
+	}
+	if(typeof key === 'number') {
+		number = key & 0xFF;
+	} else {
+		throw new Error('Invalid key format to create checksum');
+	}
+	const length = buffer.length;
+	const tuple = [];
+	let pos = 0;
+	let sum = 0;
+	const words = Math.floor(length/4);
+	for (let i = 0; i < Math.floor(length/4); i++) {
+		sum += buffer.readUInt32LE(i * 4, true);
+	}
+	sum = (sum & 0xFFFFFFFF) >>> 0;
+	for(let i = words * 4; i < length; ++i) {
+		key += buffer.readUInt8(i);
+	}
+	
+	
+	const buff = Buffer.alloc(4);
+	buff.writeUInt32LE(sum, 0);
+	key += buff.reduce((a, b) => { return a + b; });
+	return (key & 0xFF) >>> 0;
 }
 
 // Decode the packet as PRUDPv1 and check the signature
@@ -76,6 +126,7 @@ function checkPacketV1() {
 
 	// Loop over all possible keys and calculate the signature with the given key
 	for (const possibleKey of possibleKeys) {
+		console.log("Trying key: " + possibleKey);
 		const keyBuffer = Buffer.from(possibleKey);
 		const signatureKey = md5(possibleKey);
 		const signatureBase = keyBuffer.reduce((sum, byte) => sum + byte, 0);
