@@ -1,6 +1,9 @@
-const fs = require('fs');
-const crypto = require('crypto');
+const fs = require('node:fs');
+const crypto = require('node:crypto');
 const args = process.argv.slice(2);
+
+const REGEX_UTF16 = /\0([a-f0-9]\0){8}/g;
+const REGEX_UTF8 = /\0([a-f0-9]){8}/g;
 
 // Check CLI args
 const romPath = args[0];
@@ -19,10 +22,22 @@ console.time('Parsing rom for access keys');
 const romBuffer = fs.readFileSync(romPath);
 const romContents = romBuffer.toString('latin1');
 
-const regex = /([a-f0-9]\0){8}/g
-
 // Extract possible keys
-let possibleKeys = romContents.match(regex);
+let utf16Matches = romContents.match(REGEX_UTF16);
+let utf8Matches = romContents.match(REGEX_UTF8);
+
+let possibleKeys = [];
+
+if (utf16Matches) {
+	possibleKeys = [...utf16Matches];
+}
+
+if (utf8Matches) {
+	possibleKeys = [...possibleKeys, ...utf8Matches];
+}
+
+possibleKeys = possibleKeys.map(match => Buffer.from(match).toString().replace(/\0/g, ''));
+possibleKeys = [...new Set(possibleKeys)];
 
 if (!possibleKeys || possibleKeys.length === 0) {
 	console.timeEnd('Parsing rom for access keys');
@@ -31,10 +46,6 @@ if (!possibleKeys || possibleKeys.length === 0) {
 
 	return;
 }
-
-// Decode the UTF16 strings and remove duplicate entries
-possibleKeys = possibleKeys.map(match => Buffer.from(match).toString('utf16le'));
-possibleKeys = [...new Set(possibleKeys)];
 
 // If no test packet was provided, just exit here
 if (!testPacket) {
@@ -66,7 +77,7 @@ function checkPacketV0() {
 	for (const possibleKey of possibleKeys) {
 		console.log("Trying key: " + possibleKey);
 		newcheck = calc_checksum(possibleKey, packetBuffer.slice(0, packetBuffer.length - 1));
-		
+
 		// If a match is found, output the key and kill the loop
 		if(oldcheck.equals(Buffer.from([newcheck]))) {
 			console.timeEnd('Parsing rom for access keys');
