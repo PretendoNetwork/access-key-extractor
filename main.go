@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"unicode/utf16"
@@ -22,14 +24,27 @@ const (
 	UTF16_CHAR_WIDTH   = 2
 )
 
-func extractHexStrings(filepath string) ([]string, error) {
-	file, err := os.Open(filepath)
+type CLIArgs struct {
+	ShowHelp       bool
+	ROMPath        string
+	TestPacket     string
+	PreferEncoding string
+}
+
+type PossibleAccessKey struct {
+	Value          string
+	Encoding       string
+	NULLTerminated bool
+}
+
+func extractPossibleAccessKey(arguments CLIArgs) ([]string, error) {
+	file, err := os.Open(arguments.ROMPath)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	possibleAccessKeys := make([]string, 0)
+	possibleAccessKeys := make([]PossibleAccessKey, 0)
 	reader := bufio.NewReaderSize(file, CHUNK_SIZE)
 
 	offset := int64(0)
@@ -61,47 +76,111 @@ func extractHexStrings(filepath string) ([]string, error) {
 		}
 	}
 
-	possibleAccessKeysFiltered := make([]string, 0)
+	seenAccessKeys := make([]string, 0)
+	possibleAccessKeysDeduplicated := make([]PossibleAccessKey, 0)
 
 	for _, possibleAccessKey := range possibleAccessKeys {
-		if !slices.Contains(possibleAccessKeysFiltered, possibleAccessKey) {
-			possibleAccessKeysFiltered = append(possibleAccessKeysFiltered, possibleAccessKey)
+		if !slices.Contains(seenAccessKeys, possibleAccessKey.Value) {
+			seenAccessKeys = append(seenAccessKeys, possibleAccessKey.Value)
+			possibleAccessKeysDeduplicated = append(possibleAccessKeysDeduplicated, possibleAccessKey)
 		}
 	}
 
-	return possibleAccessKeysFiltered, nil
+	fileExtension := filepath.Ext(arguments.ROMPath)
+	preferEncoding := "UTF8"
+
+	if fileExtension == ".code" {
+		// * Assume 3DS dump
+		preferEncoding = "UTF16LE"
+	} else if fileExtension == ".elf" {
+		// * Assume Wii U dump
+		preferEncoding = "UTF16BE"
+	}
+
+	if arguments.PreferEncoding != "" {
+		preferEncoding = arguments.PreferEncoding
+	}
+
+	slices.SortStableFunc(possibleAccessKeysDeduplicated, func(a, b PossibleAccessKey) int {
+		// * First step: Reorder based on the preferred string encoding
+		aPreferred := a.Encoding == preferEncoding
+		bPreferred := b.Encoding == preferEncoding
+		if aPreferred != bPreferred {
+			if aPreferred {
+				return -1
+			}
+
+			return 1
+		}
+
+		// * Second step: Reorder based on whether or not the string ended with a NULL terminator
+		if a.NULLTerminated != b.NULLTerminated {
+			if a.NULLTerminated {
+				return -1
+			}
+
+			return 1
+		}
+
+		return 0
+	})
+
+	possibleAccessKeyValues := make([]string, 0)
+
+	for _, possibleAccessKey := range possibleAccessKeysDeduplicated {
+		possibleAccessKeyValues = append(possibleAccessKeyValues, possibleAccessKey.Value)
+	}
+
+	return possibleAccessKeyValues, nil
 }
 
-func extractPossibleAccessKeys(chunk []byte, charWidth int, order binary.ByteOrder) []string {
-	possibleAccessKeys := make([]string, 0)
+func extractPossibleAccessKeys(chunk []byte, charWidth int, order binary.ByteOrder) []PossibleAccessKey {
+	possibleAccessKeys := make([]PossibleAccessKey, 0)
 	stringBuffer := make([]uint16, 0, 8)
+	var lastChar uint16
 
 	checkStringBuffer := func() {
 		if len(stringBuffer) == 8 {
+			nullTerminated := lastChar == 0x00
+
 			if charWidth == 1 {
 				bytes := make([]byte, 8)
-				for j, u16 := range stringBuffer {
-					bytes[j] = byte(u16)
+				for i, u16 := range stringBuffer {
+					bytes[i] = byte(u16)
 				}
 
-				possibleAccessKeys = append(possibleAccessKeys, string(bytes))
+				possibleAccessKeys = append(possibleAccessKeys, PossibleAccessKey{
+					Value:          string(bytes),
+					Encoding:       "UTF8",
+					NULLTerminated: nullTerminated,
+				})
 			} else {
-				possibleAccessKeys = append(possibleAccessKeys, string(utf16.Decode(stringBuffer)))
+				if order == binary.BigEndian {
+					possibleAccessKeys = append(possibleAccessKeys, PossibleAccessKey{
+						Value:          string(utf16.Decode(stringBuffer)),
+						Encoding:       "UTF16BE",
+						NULLTerminated: nullTerminated,
+					})
+				} else {
+					possibleAccessKeys = append(possibleAccessKeys, PossibleAccessKey{
+						Value:          string(utf16.Decode(stringBuffer)),
+						Encoding:       "UTF16LE",
+						NULLTerminated: nullTerminated,
+					})
+				}
 			}
 		}
 	}
 
 	for i := 0; i < len(chunk); i += charWidth {
-		var char uint16
-
 		if charWidth == 1 {
-			char = uint16(chunk[i])
+			lastChar = uint16(chunk[i])
 		} else {
-			char = order.Uint16(chunk[i:])
+			lastChar = order.Uint16(chunk[i:])
 		}
 
-		if char <= 0x7F && isLowercaseHex(byte(char)) {
-			stringBuffer = append(stringBuffer, char)
+		if lastChar <= 0x7F && isLowercaseHex(byte(lastChar)) {
+			stringBuffer = append(stringBuffer, lastChar)
 		} else {
 			checkStringBuffer()
 			stringBuffer = stringBuffer[:0]
@@ -166,12 +245,33 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <rom-path> [test-packet]\n", os.Args[0])
+	arguments := CLIArgs{}
+
+	flag.BoolVar(&arguments.ShowHelp, "help", false, "Show usage information")
+	flag.StringVar(&arguments.ROMPath, "rom", "", "Path to game dump to scan")
+	flag.StringVar(&arguments.TestPacket, "packet", "", "Optional. Test packet to compare found access keys against")
+	flag.StringVar(&arguments.PreferEncoding, "prefer-encoding", "", "Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps")
+
+	flag.Parse()
+
+	if arguments.ShowHelp {
+		flag.Usage()
 		os.Exit(0)
 	}
 
-	possibleAccessKeys, err := extractHexStrings(os.Args[1])
+	if arguments.ROMPath == "" {
+		fmt.Fprintf(os.Stderr, "Missing game dump path\n")
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	if arguments.PreferEncoding != "" && arguments.PreferEncoding != "UTF8" && arguments.PreferEncoding != "UTF16BE" && arguments.PreferEncoding != "UTF16LE" {
+		fmt.Fprintf(os.Stderr, "Invalid encoding type. Can only be one of UTF8, UTF16BE, or UTF16LE\n")
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	possibleAccessKeys, err := extractPossibleAccessKey(arguments)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(0)
@@ -182,8 +282,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	if len(os.Args) == 3 {
-		packetData, err := hex.DecodeString(os.Args[2])
+	if arguments.TestPacket != "" {
+		packetData, err := hex.DecodeString(arguments.TestPacket)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(0)
