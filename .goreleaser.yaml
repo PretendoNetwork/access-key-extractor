@@ -1,0 +1,11 @@
+version: 2
+builds:
+  - id: "accesskeyextractor"
+    binary: accesskeyextractor
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
