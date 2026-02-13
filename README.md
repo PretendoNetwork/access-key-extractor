@@ -20,11 +20,18 @@ NEX game server access keys are always 8 lowercase hex characters, with the exce
 go run main.go -rom=TerrariaWiiU.elf -packet=ead0011b0000afa1c0000000000047cdc13045c9fda980d5db81456feff1000404010000011000000000000000000000000000000000040100
 ```
 
+```
+go run main.go -bruteforce -packet=ead0011b0000afa1c0000000000047cdc13045c9fda980d5db81456feff1000404010000011000000000000000000000000000000000040100
+```
+
 ## Flags
 
-| Name               | Description                                                                                                                                                                                                                                  |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-help`            | Show usage information                                                                                                                                                                                                                       |
-| `-rom`             | Path to game dump to scan                                                                                                                                                                                                                    |
-| `-packet`          | Optional. Test packet to compare found access keys against                                                                                                                                                                                   |
-| `-prefer-encoding` | Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of `UTF8`, `UTF16BE`, or `UTF16LE`. Will default to `UTF16LE` for 3DS `.code` dumps and `UTF16BE` for Wii U `.elf` dumps |
+| Name               | Description                                                                                                                                                                                                                                                    |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-help`            | Show usage information                                                                                                                                                                                                                                         |
+| `-rom`             | Optional. Path to game dump to scan. Not required if using `-bruteforce`                                                                                                                                                                                       |
+| `-packet`          | Optional. Packet to test possible access keys against. Required if using `-bruteforce`                                                                                                                                                                         |
+| `-prefer-encoding` | Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps. Ignored if using `-bruteforce` |
+| `-bruteforce`      | Optional. Bruteforce valid game server access keys without scanning a game dump. Valid access keys may not be the original access key. Requires `-packet` to be set. Will take a long time                                                                     |
+| `-stop-after`      | Optional. Stop bruteforcing after finding this number of valid access keys. Defaults to 1. Setting to 0 will check all keys from 00000000-ffffffff                                                                                                             |
+
