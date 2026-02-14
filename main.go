@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -19,7 +21,7 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/PretendoNetwork/nex-go/v2"
+	"golang.org/x/exp/constraints"
 )
 
 const (
@@ -42,6 +44,14 @@ type PossibleAccessKey struct {
 	Value          string
 	Encoding       string
 	NULLTerminated bool
+}
+
+func sum[T, O constraints.Integer](data []T) O {
+	var result O
+	for _, b := range data {
+		result += O(b)
+	}
+	return result
 }
 
 func extractPossibleAccessKey(arguments CLIArgs) ([]string, error) {
@@ -208,12 +218,62 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 	results := make(chan string, len(possibleAccessKeys))
 	validAccessKeys := make([]string, 0)
 
+	var accessKeyValidator func(packetData []byte, possibleAccessKey string) bool
+
+	// * Slimmed down implementations of defaultPRUDPv1CalculateSignature and defaultPRUDPv0CalculateChecksum.
+	// * Assuming NEX SYN client->server packet
+	if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
+		header := packetData[0x6:0xE]
+		packetSignature := packetData[0xE:0x1E]
+		optionsAndPayload := packetData[0x1E:]
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			accessKeyBytes := []byte(possibleAccessKey)
+
+			accessKeySum := sum[byte, uint32](accessKeyBytes)
+			accessKeySumBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(accessKeySumBytes, accessKeySum)
+
+			key := md5.Sum(accessKeyBytes)
+			mac := hmac.New(md5.New, key[:])
+
+			mac.Write(header)
+			mac.Write(accessKeySumBytes)
+			mac.Write(optionsAndPayload)
+
+			return bytes.Equal(packetSignature, mac.Sum(nil))
+		}
+	} else {
+		data := packetData[:len(packetData)-1]
+
+		words := make([]uint32, len(data)/4)
+
+		for i := 0; i < len(data)/4; i++ {
+			words[i] = binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
+		}
+
+		temp := sum[uint32, uint32](words) & 0xFFFFFFFF
+
+		precomputedChecksum := sum[byte, uint32](data[len(data)&^3:])
+
+		tempBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(tempBytes, temp)
+
+		precomputedChecksum += sum[byte, uint32](tempBytes)
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
+
+			return byte(checksum & 0xFF) == packetData[len(packetData)-1]
+		}
+	}
+
 	for _, possibleAccessKey := range possibleAccessKeys {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			if checkPossibleAccessKey(packetData, possibleAccessKey) {
+			if accessKeyValidator(packetData, possibleAccessKey) {
 				results <- possibleAccessKey
 			}
 		}()
@@ -268,6 +328,56 @@ func bruteforce(arguments CLIArgs) []string {
 		}
 	}()
 
+	var accessKeyValidator func(packetData []byte, possibleAccessKey string) bool
+
+	// * Slimmed down implementations of defaultPRUDPv1CalculateSignature and defaultPRUDPv0CalculateChecksum.
+	// * Assuming NEX SYN client->server packet
+	if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
+		header := packetData[0x6:0xE]
+		packetSignature := packetData[0xE:0x1E]
+		optionsAndPayload := packetData[0x1E:]
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			accessKeyBytes := []byte(possibleAccessKey)
+
+			accessKeySum := sum[byte, uint32](accessKeyBytes)
+			accessKeySumBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(accessKeySumBytes, accessKeySum)
+
+			key := md5.Sum(accessKeyBytes)
+			mac := hmac.New(md5.New, key[:])
+
+			mac.Write(header)
+			mac.Write(accessKeySumBytes)
+			mac.Write(optionsAndPayload)
+
+			return bytes.Equal(packetSignature, mac.Sum(nil))
+		}
+	} else {
+		data := packetData[:len(packetData)-1]
+
+		words := make([]uint32, len(data)/4)
+
+		for i := 0; i < len(data)/4; i++ {
+			words[i] = binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
+		}
+
+		temp := sum[uint32, uint32](words) & 0xFFFFFFFF
+
+		precomputedChecksum := sum[byte, uint32](data[len(data)&^3:])
+
+		tempBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(tempBytes, temp)
+
+		precomputedChecksum += sum[byte, uint32](tempBytes)
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
+
+			return byte(checksum & 0xFF) == packetData[len(packetData)-1]
+		}
+	}
+
 	for range runtime.NumCPU() {
 		wg.Add(1)
 		go func() {
@@ -289,7 +399,7 @@ func bruteforce(arguments CLIArgs) []string {
 
 				possibleAccessKey := fmt.Sprintf("%08x", nextValue)
 
-				if checkPossibleAccessKey(packetData, possibleAccessKey) {
+				if accessKeyValidator(packetData, possibleAccessKey) {
 					resultsMu.Lock()
 					validAccessKeys = append(validAccessKeys, possibleAccessKey)
 					resultsMu.Unlock()
@@ -306,32 +416,6 @@ func bruteforce(arguments CLIArgs) []string {
 	fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...\n", accessKeyCounter, total, validCounter)
 
 	return validAccessKeys
-}
-
-func checkPossibleAccessKey(packetData []byte, possibleAccessKey string) bool {
-	valid := false
-	server := nex.NewPRUDPServer()
-	readStream := nex.NewByteStreamIn(packetData, nil, nil)
-
-	server.AccessKey = possibleAccessKey
-
-	if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
-		packet, err := nex.NewPRUDPPacketV1(server, nil, readStream)
-		if err != nil {
-			return false
-		}
-
-		// * HACK - nex-go doesn't have a way to check the v1 signature directly,
-		// *        so just re-encode the packet directly and check if it matches
-		packet.SetSignature(packet.CalculateSignature(nil, nil))
-
-		valid = bytes.Equal(packetData, packet.Bytes())
-	} else {
-		_, err := nex.NewPRUDPPacketV0(server, nil, readStream)
-		valid = err == nil // * The v0 decoder validates the checksum for us
-	}
-
-	return valid
 }
 
 func main() {
