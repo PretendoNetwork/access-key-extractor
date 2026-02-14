@@ -32,12 +32,13 @@ const (
 )
 
 type CLIArgs struct {
-	ShowHelp            bool
-	ROMPath             string
-	Packet              string
-	PreferEncoding      string
-	Bruteforce          bool
-	BruteforceStopAfter int
+	ShowHelp                 bool
+	ROMPath                  string
+	Packet                   string
+	PreferEncoding           string
+	Bruteforce               bool
+	BruteforceStopAfter      int
+	BruteforceGoroutineCount int
 }
 
 type PossibleAccessKey struct {
@@ -264,7 +265,7 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
 			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
 
-			return byte(checksum & 0xFF) == packetData[len(packetData)-1]
+			return byte(checksum&0xFF) == packetData[len(packetData)-1]
 		}
 	}
 
@@ -296,7 +297,12 @@ func bruteforce(arguments CLIArgs) []string {
 		os.Exit(0)
 	}
 
-	fmt.Printf("Bruteforcing valid access keys using %d CPU cores. May find multiple valid access keys, there is no way to know which is the original. This may take a long time...\n", runtime.NumCPU())
+	threads := runtime.NumCPU()
+	if arguments.BruteforceGoroutineCount != 0 {
+		threads = arguments.BruteforceGoroutineCount
+	}
+
+	fmt.Printf("Bruteforcing valid access keys using %d goroutines. May find multiple valid access keys, there is no way to know which is the original. This may take a long time...\n", threads)
 
 	var wg sync.WaitGroup
 	var accessKeyCounter uint32
@@ -374,11 +380,11 @@ func bruteforce(arguments CLIArgs) []string {
 		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
 			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
 
-			return byte(checksum & 0xFF) == packetData[len(packetData)-1]
+			return byte(checksum&0xFF) == packetData[len(packetData)-1]
 		}
 	}
 
-	for range runtime.NumCPU() {
+	for range threads {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -427,6 +433,7 @@ func main() {
 	flag.StringVar(&arguments.PreferEncoding, "prefer-encoding", "", "Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps. Not required if using -bruteforce")
 	flag.BoolVar(&arguments.Bruteforce, "bruteforce", false, "Optional. Bruteforce valid game server access keys without scanning a game dump. Valid access keys may not be the original access key. Requires -packet to be set. Will take a long time")
 	flag.IntVar(&arguments.BruteforceStopAfter, "stop-after", 1, "Optional. Stop bruteforcing after finding this number of valid access keys. Defaults to 1. Setting to 0 will check all keys from 00000000-ffffffff")
+	flag.IntVar(&arguments.BruteforceGoroutineCount, "threads", 0, "Optional. Number of goroutines to use during bruteforce searching. Defaults to runtime.NumCPU(). Setting this higher than your CPU core count may result in slowdowns")
 
 	flag.Parse()
 
