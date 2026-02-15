@@ -305,12 +305,12 @@ func bruteforce(arguments CLIArgs) []string {
 	fmt.Printf("Bruteforcing valid access keys using %d goroutines. May find multiple valid access keys, there is no way to know which is the original. This may take a long time...\n", threads)
 
 	var wg sync.WaitGroup
-	var accessKeyCounter uint32
+	var accessKeyCounter uint64
 	var validCounter uint32
 	var resultsMu sync.Mutex
 	var manualStopped atomic.Bool
 	validAccessKeys := make([]string, 0) // * Using a mutex protected slice here instead of a channel since allocating space for a 0xFFFFFFFF entry channel kills memory
-	total := uint32(0xFFFFFFFF)
+	total := uint64(0x100000000)
 	progressPrinterDone := make(chan struct{})
 	stopAfter := uint32(arguments.BruteforceStopAfter)
 	sigChan := make(chan os.Signal, 1) // * Capturing CTRL+C inputs so that we can just print any valid access keys that were found when the user quits the program
@@ -328,7 +328,7 @@ func bruteforce(arguments CLIArgs) []string {
 			case <-progressPrinterDone:
 				return
 			default:
-				fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...", atomic.LoadUint32(&accessKeyCounter), total, atomic.LoadUint32(&validCounter))
+				fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...", atomic.LoadUint64(&accessKeyCounter), total-1, atomic.LoadUint32(&validCounter))
 				time.Sleep(100 * time.Millisecond) // * Stops the printer from flashing sometimes
 			}
 		}
@@ -398,7 +398,7 @@ func bruteforce(arguments CLIArgs) []string {
 					return
 				}
 
-				nextValue := atomic.AddUint32(&accessKeyCounter, 1) - 1
+				nextValue := atomic.AddUint64(&accessKeyCounter, 1) - 1
 				if nextValue >= total {
 					return
 				}
@@ -419,7 +419,7 @@ func bruteforce(arguments CLIArgs) []string {
 	close(progressPrinterDone)
 	signal.Stop(sigChan)
 
-	fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...\n", accessKeyCounter, total, validCounter)
+	fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...\n", accessKeyCounter, total-1, validCounter)
 
 	return validAccessKeys
 }
