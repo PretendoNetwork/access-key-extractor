@@ -3,18 +3,25 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 	"unicode/utf16"
 
-	"github.com/PretendoNetwork/nex-go/v2"
+	"golang.org/x/exp/constraints"
 )
 
 const (
@@ -25,16 +32,27 @@ const (
 )
 
 type CLIArgs struct {
-	ShowHelp       bool
-	ROMPath        string
-	TestPacket     string
-	PreferEncoding string
+	ShowHelp                 bool
+	ROMPath                  string
+	Packet                   string
+	PreferEncoding           string
+	Bruteforce               bool
+	BruteforceStopAfter      int
+	BruteforceGoroutineCount int
 }
 
 type PossibleAccessKey struct {
 	Value          string
 	Encoding       string
 	NULLTerminated bool
+}
+
+func sum[T, O constraints.Integer](data []T) O {
+	var result O
+	for _, b := range data {
+		result += O(b)
+	}
+	return result
 }
 
 func extractPossibleAccessKey(arguments CLIArgs) ([]string, error) {
@@ -201,34 +219,62 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 	results := make(chan string, len(possibleAccessKeys))
 	validAccessKeys := make([]string, 0)
 
+	var accessKeyValidator func(packetData []byte, possibleAccessKey string) bool
+
+	// * Slimmed down implementations of defaultPRUDPv1CalculateSignature and defaultPRUDPv0CalculateChecksum.
+	// * Assuming NEX SYN client->server packet
+	if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
+		header := packetData[0x6:0xE]
+		packetSignature := packetData[0xE:0x1E]
+		optionsAndPayload := packetData[0x1E:]
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			accessKeyBytes := []byte(possibleAccessKey)
+
+			accessKeySum := sum[byte, uint32](accessKeyBytes)
+			accessKeySumBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(accessKeySumBytes, accessKeySum)
+
+			key := md5.Sum(accessKeyBytes)
+			mac := hmac.New(md5.New, key[:])
+
+			mac.Write(header)
+			mac.Write(accessKeySumBytes)
+			mac.Write(optionsAndPayload)
+
+			return bytes.Equal(packetSignature, mac.Sum(nil))
+		}
+	} else {
+		data := packetData[:len(packetData)-1]
+
+		words := make([]uint32, len(data)/4)
+
+		for i := 0; i < len(data)/4; i++ {
+			words[i] = binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
+		}
+
+		temp := sum[uint32, uint32](words) & 0xFFFFFFFF
+
+		precomputedChecksum := sum[byte, uint32](data[len(data)&^3:])
+
+		tempBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(tempBytes, temp)
+
+		precomputedChecksum += sum[byte, uint32](tempBytes)
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
+
+			return byte(checksum&0xFF) == packetData[len(packetData)-1]
+		}
+	}
+
 	for _, possibleAccessKey := range possibleAccessKeys {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			valid := false
-			server := nex.NewPRUDPServer()
-			readStream := nex.NewByteStreamIn(packetData, nil, nil)
-
-			server.AccessKey = possibleAccessKey
-
-			if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
-				packet, err := nex.NewPRUDPPacketV1(server, nil, readStream)
-				if err != nil {
-					return
-				}
-
-				// * HACK - nex-go doesn't have a way to check the v1 signature directly,
-				// *        so just re-encode the packet directly and check if it matches
-				packet.SetSignature(packet.CalculateSignature(nil, nil))
-
-				valid = bytes.Equal(packetData, packet.Bytes())
-			} else {
-				_, err := nex.NewPRUDPPacketV0(server, nil, readStream)
-				valid = err == nil // * The v0 decoder validates the checksum for us
-			}
-
-			if valid {
+			if accessKeyValidator(packetData, possibleAccessKey) {
 				results <- possibleAccessKey
 			}
 		}()
@@ -244,13 +290,150 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 	return validAccessKeys
 }
 
+func bruteforce(arguments CLIArgs) []string {
+	packetData, err := hex.DecodeString(arguments.Packet)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error decoding sample packet: %v\n", err)
+		os.Exit(0)
+	}
+
+	threads := runtime.NumCPU()
+	if arguments.BruteforceGoroutineCount != 0 {
+		threads = arguments.BruteforceGoroutineCount
+	}
+
+	fmt.Printf("Bruteforcing valid access keys using %d goroutines. May find multiple valid access keys, there is no way to know which is the original. This may take a long time...\n", threads)
+
+	var wg sync.WaitGroup
+	var accessKeyCounter uint64
+	var validCounter uint32
+	var resultsMu sync.Mutex
+	var manualStopped atomic.Bool
+	validAccessKeys := make([]string, 0) // * Using a mutex protected slice here instead of a channel since allocating space for a 0xFFFFFFFF entry channel kills memory
+	total := uint64(0x100000000)
+	progressPrinterDone := make(chan struct{})
+	stopAfter := uint32(arguments.BruteforceStopAfter)
+	sigChan := make(chan os.Signal, 1) // * Capturing CTRL+C inputs so that we can just print any valid access keys that were found when the user quits the program
+
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		manualStopped.Store(true)
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-progressPrinterDone:
+				return
+			default:
+				fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...", atomic.LoadUint64(&accessKeyCounter), total-1, atomic.LoadUint32(&validCounter))
+				time.Sleep(100 * time.Millisecond) // * Stops the printer from flashing sometimes
+			}
+		}
+	}()
+
+	var accessKeyValidator func(packetData []byte, possibleAccessKey string) bool
+
+	// * Slimmed down implementations of defaultPRUDPv1CalculateSignature and defaultPRUDPv0CalculateChecksum.
+	// * Assuming NEX SYN client->server packet
+	if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
+		header := packetData[0x6:0xE]
+		packetSignature := packetData[0xE:0x1E]
+		optionsAndPayload := packetData[0x1E:]
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			accessKeyBytes := []byte(possibleAccessKey)
+
+			accessKeySum := sum[byte, uint32](accessKeyBytes)
+			accessKeySumBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(accessKeySumBytes, accessKeySum)
+
+			key := md5.Sum(accessKeyBytes)
+			mac := hmac.New(md5.New, key[:])
+
+			mac.Write(header)
+			mac.Write(accessKeySumBytes)
+			mac.Write(optionsAndPayload)
+
+			return bytes.Equal(packetSignature, mac.Sum(nil))
+		}
+	} else {
+		data := packetData[:len(packetData)-1]
+
+		words := make([]uint32, len(data)/4)
+
+		for i := 0; i < len(data)/4; i++ {
+			words[i] = binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
+		}
+
+		temp := sum[uint32, uint32](words) & 0xFFFFFFFF
+
+		precomputedChecksum := sum[byte, uint32](data[len(data)&^3:])
+
+		tempBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(tempBytes, temp)
+
+		precomputedChecksum += sum[byte, uint32](tempBytes)
+
+		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
+			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
+
+			return byte(checksum&0xFF) == packetData[len(packetData)-1]
+		}
+	}
+
+	for range threads {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for {
+				if manualStopped.Load() {
+					return
+				}
+
+				if stopAfter != 0 && stopAfter <= atomic.LoadUint32(&validCounter) {
+					return
+				}
+
+				nextValue := atomic.AddUint64(&accessKeyCounter, 1) - 1
+				if nextValue >= total {
+					return
+				}
+
+				possibleAccessKey := fmt.Sprintf("%08x", nextValue)
+
+				if accessKeyValidator(packetData, possibleAccessKey) {
+					resultsMu.Lock()
+					validAccessKeys = append(validAccessKeys, possibleAccessKey)
+					resultsMu.Unlock()
+					atomic.AddUint32(&validCounter, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(progressPrinterDone)
+	signal.Stop(sigChan)
+
+	fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...\n", accessKeyCounter, total-1, validCounter)
+
+	return validAccessKeys
+}
+
 func main() {
 	arguments := CLIArgs{}
 
 	flag.BoolVar(&arguments.ShowHelp, "help", false, "Show usage information")
-	flag.StringVar(&arguments.ROMPath, "rom", "", "Path to game dump to scan")
-	flag.StringVar(&arguments.TestPacket, "packet", "", "Optional. Test packet to compare found access keys against")
-	flag.StringVar(&arguments.PreferEncoding, "prefer-encoding", "", "Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps")
+	flag.StringVar(&arguments.ROMPath, "rom", "", "Optional. Path to game dump to scan. Not required if using -bruteforce")
+	flag.StringVar(&arguments.Packet, "packet", "", "Optional. Packet to test possible access keys against. Required if using -bruteforce")
+	flag.StringVar(&arguments.PreferEncoding, "prefer-encoding", "", "Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps. Not required if using -bruteforce")
+	flag.BoolVar(&arguments.Bruteforce, "bruteforce", false, "Optional. Bruteforce valid game server access keys without scanning a game dump. Valid access keys may not be the original access key. Requires -packet to be set. Will take a long time")
+	flag.IntVar(&arguments.BruteforceStopAfter, "stop-after", 1, "Optional. Stop bruteforcing after finding this number of valid access keys. Defaults to 1. Setting to 0 will check all keys from 00000000-ffffffff")
+	flag.IntVar(&arguments.BruteforceGoroutineCount, "threads", 0, "Optional. Number of goroutines to use during bruteforce searching. Defaults to runtime.NumCPU(). Setting this higher than your CPU core count may result in slowdowns")
 
 	flag.Parse()
 
@@ -259,8 +442,14 @@ func main() {
 		os.Exit(0)
 	}
 
-	if arguments.ROMPath == "" {
-		fmt.Fprintf(os.Stderr, "Missing game dump path\n")
+	if arguments.ROMPath == "" && !arguments.Bruteforce {
+		fmt.Fprintf(os.Stderr, "Missing game dump path and not using -bruteforce\n")
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	if arguments.Bruteforce && arguments.Packet == "" {
+		fmt.Fprintf(os.Stderr, "Missing sample packet\n")
 		flag.Usage()
 		os.Exit(0)
 	}
@@ -271,38 +460,53 @@ func main() {
 		os.Exit(0)
 	}
 
-	possibleAccessKeys, err := extractPossibleAccessKey(arguments)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(0)
-	}
-
-	if len(possibleAccessKeys) == 0 {
-		fmt.Println("No possible access keys found")
-		os.Exit(0)
-	}
-
-	if arguments.TestPacket != "" {
-		packetData, err := hex.DecodeString(arguments.TestPacket)
+	if !arguments.Bruteforce {
+		fmt.Println("Scanning game dump")
+		possibleAccessKeys, err := extractPossibleAccessKey(arguments)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error scanning game dump: %v\n", err)
 			os.Exit(0)
 		}
 
-		fmt.Println("Checking test packet...")
+		if len(possibleAccessKeys) == 0 {
+			fmt.Println("No possible access keys found")
+			os.Exit(0)
+		}
 
-		validAccessKeys := checkPacket(packetData, possibleAccessKeys)
+		if arguments.Packet != "" {
+			packetData, err := hex.DecodeString(arguments.Packet)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error decoding sample packet: %v\n", err)
+				os.Exit(0)
+			}
 
-		fmt.Printf("Found %d valid access key(s):\n", len(validAccessKeys))
+			fmt.Println("Checking test packet...")
 
-		for _, validAccessKey := range validAccessKeys {
-			fmt.Printf("%s\n", validAccessKey)
+			validAccessKeys := checkPacket(packetData, possibleAccessKeys)
+
+			fmt.Printf("Found %d valid access key(s):\n", len(validAccessKeys))
+
+			for _, validAccessKey := range validAccessKeys {
+				fmt.Printf("%s\n", validAccessKey)
+			}
+		} else {
+			for _, possibleAccessKey := range possibleAccessKeys {
+				fmt.Printf("%s\n", possibleAccessKey)
+			}
+
+			fmt.Printf("No test packet provided. Found %d possible access key(s) (the correct key is usually one of the first)\n", len(possibleAccessKeys))
 		}
 	} else {
-		for _, possibleAccessKey := range possibleAccessKeys {
-			fmt.Printf("%s\n", possibleAccessKey)
-		}
+		validAccessKeys := bruteforce(arguments)
 
-		fmt.Printf("No test packet provided. Found %d possible access key(s) (the correct key is usually one of the first)\n", len(possibleAccessKeys))
+		if len(validAccessKeys) == 0 {
+			fmt.Println("No possible access keys found. This may indicate the packet data is incorrect, the title uses a different access key format, or the title uses a different signature/checksum algorithm")
+		} else {
+			fmt.Printf("Found %d valid access key(s):\n", len(validAccessKeys))
+
+			for _, validAccessKey := range validAccessKeys {
+				fmt.Printf("%s\n", validAccessKey)
+			}
+		}
 	}
 }
