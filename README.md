@@ -58,7 +58,9 @@ When a sample packet is provided, the program will loop over all potential acces
 
 ## Collision
 
-The standard convention for NEX game server access keys is 8 lower case hex characters, and the sum of the access key bytes are used in the PRUDP signature/checksum calculations. Because of this, the program may find multiple valid access keys, since keys such as `00000001` and `10000000` have the same byte sums. When using the ROM scanning mode, the chances of a collision being found are extremely low, if not impossible. Thus, you can be confident that if a valid access key is found, it is the original. However when using the bruteforcing mode, this is not guaranteed.
+The standard convention for NEX game server access keys is 8 lower case hex characters, and the sum of the access key bytes are used in the PRUDP signature/checksum calculations. Because of this, the program may find multiple valid access keys. When using the ROM scanning mode, the chances of a collision being found are extremely low, if not impossible, as the number of candidate access keys is very limited. Thus, you can be confident that if a valid access key is found, it is the original. However when using the bruteforcing mode, this is not guaranteed.
+
+Since PRUDPv0 uses the sum of the access key bytes as part of the checksum calculation, and there are only 429 unique byte sums for the strings `00000000` to `ffffffff`, every game which uses PRUDPv0 will have multiple valid access keys. PRUDPv1 uses the access key directly, meaning every game which uses PRUDPv1 will have exactly 1 valid access key.
 
 ## Flags
 
