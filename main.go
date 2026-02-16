@@ -10,18 +10,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"main/bruteforce"
+	"main/common"
+	types "main/common"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
 	"unicode/utf16"
-
-	"golang.org/x/exp/constraints"
 )
 
 const (
@@ -31,14 +27,42 @@ const (
 	UTF16_CHAR_WIDTH   = 2
 )
 
-type CLIArgs struct {
-	ShowHelp                 bool
-	ROMPath                  string
-	Packet                   string
-	PreferEncoding           string
-	Bruteforce               bool
-	BruteforceStopAfter      int
-	BruteforceGoroutineCount int
+type cliArgs struct {
+	showHelp                 bool
+	romPath                  string
+	packet                   string
+	preferEncoding           string
+	bruteforce               bool
+	bruteforceGoroutineCount int
+	gpu                      bool
+}
+
+func (c cliArgs) ShowHelp() bool {
+	return c.showHelp
+}
+
+func (c cliArgs) ROMPath() string {
+	return c.romPath
+}
+
+func (c cliArgs) Packet() string {
+	return c.packet
+}
+
+func (c cliArgs) PreferEncoding() string {
+	return c.preferEncoding
+}
+
+func (c cliArgs) Bruteforce() bool {
+	return c.bruteforce
+}
+
+func (c cliArgs) BruteforceGoroutineCount() int {
+	return c.bruteforceGoroutineCount
+}
+
+func (c cliArgs) GPU() bool {
+	return c.gpu
 }
 
 type PossibleAccessKey struct {
@@ -47,16 +71,8 @@ type PossibleAccessKey struct {
 	NULLTerminated bool
 }
 
-func sum[T, O constraints.Integer](data []T) O {
-	var result O
-	for _, b := range data {
-		result += O(b)
-	}
-	return result
-}
-
-func extractPossibleAccessKey(arguments CLIArgs) ([]string, error) {
-	file, err := os.Open(arguments.ROMPath)
+func extractPossibleAccessKey(arguments types.CLIArgs) ([]string, error) {
+	file, err := os.Open(arguments.ROMPath())
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +120,7 @@ func extractPossibleAccessKey(arguments CLIArgs) ([]string, error) {
 		}
 	}
 
-	fileExtension := filepath.Ext(arguments.ROMPath)
+	fileExtension := filepath.Ext(arguments.ROMPath())
 	preferEncoding := "UTF8"
 
 	if fileExtension == ".code" {
@@ -115,8 +131,8 @@ func extractPossibleAccessKey(arguments CLIArgs) ([]string, error) {
 		preferEncoding = "UTF16BE"
 	}
 
-	if arguments.PreferEncoding != "" {
-		preferEncoding = arguments.PreferEncoding
+	if arguments.PreferEncoding() != "" {
+		preferEncoding = arguments.PreferEncoding()
 	}
 
 	slices.SortStableFunc(possibleAccessKeysDeduplicated, func(a, b PossibleAccessKey) int {
@@ -231,7 +247,7 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
 			accessKeyBytes := []byte(possibleAccessKey)
 
-			accessKeySum := sum[byte, uint32](accessKeyBytes)
+			accessKeySum := common.Sum[byte, uint32](accessKeyBytes)
 			accessKeySumBytes := make([]byte, 4)
 			binary.LittleEndian.PutUint32(accessKeySumBytes, accessKeySum)
 
@@ -253,17 +269,17 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 			words[i] = binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
 		}
 
-		temp := sum[uint32, uint32](words) & 0xFFFFFFFF
+		temp := common.Sum[uint32, uint32](words) & 0xFFFFFFFF
 
-		precomputedChecksum := sum[byte, uint32](data[len(data)&^3:])
+		precomputedChecksum := common.Sum[byte, uint32](data[len(data)&^3:])
 
 		tempBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(tempBytes, temp)
 
-		precomputedChecksum += sum[byte, uint32](tempBytes)
+		precomputedChecksum += common.Sum[byte, uint32](tempBytes)
 
 		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
-			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
+			checksum := precomputedChecksum + common.Sum[byte, uint32]([]byte(possibleAccessKey))
 
 			return byte(checksum&0xFF) == packetData[len(packetData)-1]
 		}
@@ -290,177 +306,43 @@ func checkPacket(packetData []byte, possibleAccessKeys []string) []string {
 	return validAccessKeys
 }
 
-func bruteforce(arguments CLIArgs) []string {
-	packetData, err := hex.DecodeString(arguments.Packet)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error decoding sample packet: %v\n", err)
-		os.Exit(0)
-	}
-
-	threads := runtime.NumCPU()
-	if arguments.BruteforceGoroutineCount != 0 {
-		threads = arguments.BruteforceGoroutineCount
-	}
-
-	fmt.Printf("Bruteforcing valid access keys using %d goroutines. May find multiple valid access keys, there is no way to know which is the original. This may take a long time...\n", threads)
-
-	var wg sync.WaitGroup
-	var accessKeyCounter uint64
-	var validCounter uint32
-	var resultsMu sync.Mutex
-	var manualStopped atomic.Bool
-	validAccessKeys := make([]string, 0) // * Using a mutex protected slice here instead of a channel since allocating space for a 0xFFFFFFFF entry channel kills memory
-	total := uint64(0x100000000)
-	progressPrinterDone := make(chan struct{})
-	stopAfter := uint32(arguments.BruteforceStopAfter)
-	sigChan := make(chan os.Signal, 1) // * Capturing CTRL+C inputs so that we can just print any valid access keys that were found when the user quits the program
-
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		manualStopped.Store(true)
-	}()
-
-	go func() {
-		for {
-			select {
-			case <-progressPrinterDone:
-				return
-			default:
-				fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...", atomic.LoadUint64(&accessKeyCounter), total-1, atomic.LoadUint32(&validCounter))
-				time.Sleep(100 * time.Millisecond) // * Stops the printer from flashing sometimes
-			}
-		}
-	}()
-
-	var accessKeyValidator func(packetData []byte, possibleAccessKey string) bool
-
-	// * Slimmed down implementations of defaultPRUDPv1CalculateSignature and defaultPRUDPv0CalculateChecksum.
-	// * Assuming NEX SYN client->server packet
-	if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
-		header := packetData[0x6:0xE]
-		packetSignature := packetData[0xE:0x1E]
-		optionsAndPayload := packetData[0x1E:]
-
-		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
-			accessKeyBytes := []byte(possibleAccessKey)
-
-			accessKeySum := sum[byte, uint32](accessKeyBytes)
-			accessKeySumBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(accessKeySumBytes, accessKeySum)
-
-			key := md5.Sum(accessKeyBytes)
-			mac := hmac.New(md5.New, key[:])
-
-			mac.Write(header)
-			mac.Write(accessKeySumBytes)
-			mac.Write(optionsAndPayload)
-
-			return bytes.Equal(packetSignature, mac.Sum(nil))
-		}
-	} else {
-		data := packetData[:len(packetData)-1]
-
-		words := make([]uint32, len(data)/4)
-
-		for i := 0; i < len(data)/4; i++ {
-			words[i] = binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
-		}
-
-		temp := sum[uint32, uint32](words) & 0xFFFFFFFF
-
-		precomputedChecksum := sum[byte, uint32](data[len(data)&^3:])
-
-		tempBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(tempBytes, temp)
-
-		precomputedChecksum += sum[byte, uint32](tempBytes)
-
-		accessKeyValidator = func(packetData []byte, possibleAccessKey string) bool {
-			checksum := precomputedChecksum + sum[byte, uint32]([]byte(possibleAccessKey))
-
-			return byte(checksum&0xFF) == packetData[len(packetData)-1]
-		}
-	}
-
-	for range threads {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for {
-				if manualStopped.Load() {
-					return
-				}
-
-				if stopAfter != 0 && stopAfter <= atomic.LoadUint32(&validCounter) {
-					return
-				}
-
-				nextValue := atomic.AddUint64(&accessKeyCounter, 1) - 1
-				if nextValue >= total {
-					return
-				}
-
-				possibleAccessKey := fmt.Sprintf("%08x", nextValue)
-
-				if accessKeyValidator(packetData, possibleAccessKey) {
-					resultsMu.Lock()
-					validAccessKeys = append(validAccessKeys, possibleAccessKey)
-					resultsMu.Unlock()
-					atomic.AddUint32(&validCounter, 1)
-				}
-			}
-		}()
-	}
-
-	wg.Wait()
-	close(progressPrinterDone)
-	signal.Stop(sigChan)
-
-	fmt.Printf("\rChecked %d/%d possible access keys (found %d valid)...\n", accessKeyCounter, total-1, validCounter)
-
-	return validAccessKeys
-}
-
 func main() {
-	arguments := CLIArgs{}
+	arguments := cliArgs{}
 
-	flag.BoolVar(&arguments.ShowHelp, "help", false, "Show usage information")
-	flag.StringVar(&arguments.ROMPath, "rom", "", "Optional. Path to game dump to scan. Not required if using -bruteforce")
-	flag.StringVar(&arguments.Packet, "packet", "", "Optional. Packet to test possible access keys against. Required if using -bruteforce")
-	flag.StringVar(&arguments.PreferEncoding, "prefer-encoding", "", "Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps. Not required if using -bruteforce")
-	flag.BoolVar(&arguments.Bruteforce, "bruteforce", false, "Optional. Bruteforce valid game server access keys without scanning a game dump. Valid access keys may not be the original access key. Requires -packet to be set. Will take a long time")
-	flag.IntVar(&arguments.BruteforceStopAfter, "stop-after", 1, "Optional. Stop bruteforcing after finding this number of valid access keys. Defaults to 1. Setting to 0 will check all keys from 00000000-ffffffff")
-	flag.IntVar(&arguments.BruteforceGoroutineCount, "threads", 0, "Optional. Number of goroutines to use during bruteforce searching. Defaults to runtime.NumCPU(). Setting this higher than your CPU core count may result in slowdowns")
+	flag.BoolVar(&arguments.showHelp, "help", false, "Show usage information")
+	flag.StringVar(&arguments.romPath, "rom", "", "Optional. Path to game dump to scan. Not required if using -bruteforce")
+	flag.StringVar(&arguments.packet, "packet", "", "Optional. Packet to test possible access keys against. Required if using -bruteforce")
+	flag.StringVar(&arguments.preferEncoding, "prefer-encoding", "", "Optional. Reorder potential access keys to place those which use this encoding at the start of the list. Can be one of UTF8, UTF16BE, or UTF16LE. Will default to UTF16LE for 3DS .code dumps and UTF16BE for Wii U .elf dumps. Not required if using -bruteforce")
+	flag.BoolVar(&arguments.bruteforce, "bruteforce", false, "Optional. Bruteforce valid game server access keys without scanning a game dump. Valid access keys may not be the original access key. Requires -packet to be set. Will take a long time")
+	flag.IntVar(&arguments.bruteforceGoroutineCount, "threads", 0, "Optional. Number of goroutines to use during bruteforce searching. Defaults to runtime.NumCPU(). Setting this higher than your CPU core count may result in slowdowns")
+	flag.BoolVar(&arguments.gpu, "gpu", false, "Optional. GPU backend to use with -bruteforce (e.g., metal, nvidia, cuda). If set without a value, auto-detects GPU. If not set, bruteforcing is done on the CPU")
 
 	flag.Parse()
 
-	if arguments.ShowHelp {
+	if arguments.showHelp {
 		flag.Usage()
 		os.Exit(0)
 	}
 
-	if arguments.ROMPath == "" && !arguments.Bruteforce {
+	if arguments.romPath == "" && !arguments.bruteforce {
 		fmt.Fprintf(os.Stderr, "Missing game dump path and not using -bruteforce\n")
 		flag.Usage()
 		os.Exit(0)
 	}
 
-	if arguments.Bruteforce && arguments.Packet == "" {
+	if arguments.bruteforce && arguments.packet == "" {
 		fmt.Fprintf(os.Stderr, "Missing sample packet\n")
 		flag.Usage()
 		os.Exit(0)
 	}
 
-	if arguments.PreferEncoding != "" && arguments.PreferEncoding != "UTF8" && arguments.PreferEncoding != "UTF16BE" && arguments.PreferEncoding != "UTF16LE" {
+	if arguments.preferEncoding != "" && arguments.preferEncoding != "UTF8" && arguments.preferEncoding != "UTF16BE" && arguments.preferEncoding != "UTF16LE" {
 		fmt.Fprintf(os.Stderr, "Invalid encoding type. Can only be one of UTF8, UTF16BE, or UTF16LE\n")
 		flag.Usage()
 		os.Exit(0)
 	}
 
-	if !arguments.Bruteforce {
+	if !arguments.bruteforce {
 		fmt.Println("Scanning game dump")
 		possibleAccessKeys, err := extractPossibleAccessKey(arguments)
 		if err != nil {
@@ -473,8 +355,8 @@ func main() {
 			os.Exit(0)
 		}
 
-		if arguments.Packet != "" {
-			packetData, err := hex.DecodeString(arguments.Packet)
+		if arguments.packet != "" {
+			packetData, err := hex.DecodeString(arguments.packet)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error decoding sample packet: %v\n", err)
 				os.Exit(0)
@@ -497,15 +379,38 @@ func main() {
 			fmt.Printf("No test packet provided. Found %d possible access key(s) (the correct key is usually one of the first)\n", len(possibleAccessKeys))
 		}
 	} else {
-		validAccessKeys := bruteforce(arguments)
+		var result bruteforce.BruteforceResultGPU
+		var backend bruteforce.Backend
+		isV0 := false
 
-		if len(validAccessKeys) == 0 {
+		if !arguments.gpu {
+			backend = bruteforce.GetCPUBackend()
+		} else {
+			backend = bruteforce.GetBackend()
+		}
+
+		packetData, err := hex.DecodeString(arguments.Packet())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error decoding sample packet: %v\n", err)
+			os.Exit(0)
+		}
+
+		fmt.Printf("Using %s backend\n", backend.Name())
+
+		if bytes.Equal(packetData[:2], []byte{0xEA, 0xD0}) {
+			result = backend.BruteforceV1HMAC(arguments)
+		} else {
+			isV0 = true
+			result = backend.BruteforceV0Checksum(arguments)
+		}
+
+		if !result.Found {
 			fmt.Println("No possible access keys found. This may indicate the packet data is incorrect, the title uses a different access key format, or the title uses a different signature/checksum algorithm")
 		} else {
-			fmt.Printf("Found %d valid access key(s):\n", len(validAccessKeys))
-
-			for _, validAccessKey := range validAccessKeys {
-				fmt.Printf("%s\n", validAccessKey)
+			if isV0 {
+				fmt.Printf("Found valid game server access key (cannot determine if this is the original game server access key): %s\n", result.Value)
+			} else {
+				fmt.Printf("Found original game server access key: %s\n", result.Value)
 			}
 		}
 	}
